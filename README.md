@@ -11,3 +11,6 @@
 
 - [ ] Decide on framework, type of agent, hyperparameters, etc
     * Suggested type according to reasearch: Deep Q-learning Network
+    * Single learning vs. batch learning
+    * Implement memory
+    

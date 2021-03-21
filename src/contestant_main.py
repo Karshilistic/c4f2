@@ -10,14 +10,26 @@ else:
 from sumolib import checkBinary  # noqa
 import traci  # noqa
 import random
+import numpy as np
 
 from Agent import Agent
-from sumo_utils import run_episode
+from sumo_utils import run_episode, get_state
 from gen_sim import gen_sim
 
-NUM_EPISODES = 2  # Number of complete simulation runs
+NUM_EPISODES = 30  # Number of complete simulation runs
 COMPETITION_ROUND = 1  # 1 or 2, depending on which competition round you are in
 random.seed(COMPETITION_ROUND)
+
+# Hyperparameters
+NUMBER_OF_LAYERS = 1    # Number of layers of NN
+LAYER_WIDTH = 30         # Number of neurons in layer
+LEARNING_RATE = 0.0001   # Alpha, learning rate
+GAMMA = 0.75            # Discount Factor
+TRAINING_EPOCHS = 100
+BATCH_SIZE = 32
+
+NUM_OF_STATES = 9       # 1 current state, 8 detectors
+NUM_OF_ACTIONS = 1      # either 0 or 1
 
 """
 state = [curr_open_dir, 8*detector(waiting times)]
@@ -39,8 +51,10 @@ if __name__ == "__main__":
 
     # sumoBinary = checkBinary('sumo-gui')
 
-    agent = Agent()  # Instantiate your agent object
+    agent = Agent(NUMBER_OF_LAYERS, LAYER_WIDTH, LEARNING_RATE, GAMMA, TRAINING_EPOCHS, NUM_EPISODES)  # Instantiate your agent object
     waiting_time_per_episode = []  # A list to hold the average waiting time per vehicle returned from every episode
+    
+    # epsilon = 0                     # Used in Epsilon-greedy policy (increases exploration)
 
     for e in range(NUM_EPISODES):
         # Generate an episode with the specified probabilities for lanes in the intersection
@@ -71,3 +85,50 @@ if __name__ == "__main__":
 
         print('episode[' + str(e) + '] Average waiting time = ' + str(avg_waiting_time)
               + ' (s) -- Average Emissions (CO2) = ' + str(avg_emissions) + "(g)")
+        
+
+        for _ in range(TRAINING_EPOCHS):
+            # REPLAY FUNCTION
+            sample = agent.get_memory()
+            ## Get random samples of defined batch size
+            if len(sample) < BATCH_SIZE:
+                batch = random.sample(sample, len(sample))
+            else:
+                batch = random.sample(sample, BATCH_SIZE)
+
+            ## Get states
+            # if len(batch) > 0:
+            state = []
+            next_state = []
+            for elem in range(len(batch)):
+                state.append(batch[elem][0])
+                next_state.append(batch[elem][3])
+
+            state = np.array(state)
+            next_state = np.array(next_state)
+
+            ## Get predicted state
+            q_sa = agent.predict(state)
+            q_sa_future = agent.predict(next_state)
+            # print(q_sa, " ", q_sa_future)
+            ## Train
+            ### Prepare training data
+            X = np.zeros((len(batch), NUM_OF_STATES))
+            y = np.zeros((len(batch), NUM_OF_ACTIONS))
+
+            for i, elem in enumerate(batch):
+                # print(i, " ", elem)
+                state_, action_, reward_= elem[0], elem[1], elem[2]
+                # print(state_)
+                # print(action_)
+                # print(reward_)
+                q_sa_current = q_sa[i]
+                # print(q_sa_current)
+                q_sa_current = reward_ + GAMMA * np.amax(q_sa_future[i])
+                # print(q_sa_current)
+                X[i] = state_
+                y[i] = q_sa_current
+            # print(X)
+            # print(y)
+            agent.train_model(X, y)
+
