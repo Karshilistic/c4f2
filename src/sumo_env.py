@@ -1,21 +1,26 @@
-from __future__ import absolute_import
-from __future__ import division
-from __future__ import print_function
+from __future__ import absolute_import, division, print_function
 
-import abc
-import tensorflow as tf
+import base64
+import matplotlib
+import matplotlib.pyplot as plt
 import numpy as np
 
-from tf_agents.environments import py_environment
-from tf_agents.environments import tf_environment
-from tf_agents.environments import tf_py_environment
-from tf_agents.environments import utils
-from tf_agents.specs import array_spec
-from tf_agents.environments import wrappers
-from tf_agents.environments import suite_gym
-from tf_agents.trajectories import time_step as ts
+import tensorflow as tf
 
-tf.compat.v1.enable_v2_behavior()
+from tf_agents.specs import array_spec
+from tf_agents.environments import py_environment
+from tf_agents.agents.dqn import dqn_agent
+from tf_agents.drivers import dynamic_step_driver
+from tf_agents.environments import tf_py_environment
+from tf_agents.eval import metric_utils
+from tf_agents.metrics import tf_metrics
+from tf_agents.networks import sequential
+from tf_agents.policies import random_tf_policy
+from tf_agents.replay_buffers import tf_uniform_replay_buffer
+from tf_agents.trajectories import trajectory
+from tf_agents.trajectories import time_step as ts
+from tf_agents.specs import tensor_spec
+from tf_agents.utils import common
 
 import os
 import sys
@@ -39,21 +44,18 @@ CENSOR_PROBABILITY = 0.1
 
 class SimulationEnv(py_environment.PyEnvironment):
 
-    def __init__(self, competition_round):
+    def __init__(self, name, competition_round):
         self._action_spec = array_spec.BoundedArraySpec(
             shape=(), dtype=np.int32, minimum=0, maximum=1, name='action')
         self._observation_spec = array_spec.BoundedArraySpec(
-            shape=(1,9), dtype=np.int32, name='observation')
+            shape=(1,9), dtype=np.int32, minimum=0, name='observation')
 
         print('Starting Sumo...')
         # The normal way to start sumo on the CLI
         self._sumoBinary = checkBinary('sumo')
         # comment the line above and uncomment the following one to instantiate the simulation with the GUI
         # sumoBinary = checkBinary('sumo-gui')
-
-        traci.switch("contestant")
-        traci.close()
-
+        self._name = name
         # Generate an episode with the specified probabilities for lanes in the intersection
         # Returns the number of vehicles that will be generated in the episode
         self._vehicles = gen_sim('', round=competition_round,
@@ -64,9 +66,9 @@ class SimulationEnv(py_environment.PyEnvironment):
         # subprocess and then the python script connects and runs
         traci.start([self._sumoBinary, "-c", "data/cross.sumocfg",
                      "--time-to-teleport", "-1",
-                     "--tripinfo-output", "tripinfo.xml", '--start', '-Q'], label='contestant')
+                     "--tripinfo-output", "tripinfo.xml", '--start', '-Q'], label=self._name)
         # Connection to simulation environment
-        self._conn = traci.getConnection("contestant")
+        self._conn = traci.getConnection(self._name)
 
         self._competition_round = competition_round
         # self._state = [0, 0, 0, 0, 0, 0, 0, 0, 0]
@@ -92,7 +94,7 @@ class SimulationEnv(py_environment.PyEnvironment):
         return self._observation_spec
 
     def _reset(self):
-        traci.switch("contestant")
+        traci.switch(self._name)
         traci.close()
 
         # Calculate the avg waiting time per vehicle
@@ -116,9 +118,9 @@ class SimulationEnv(py_environment.PyEnvironment):
         # subprocess and then the python script connects and runs
         traci.start([self._sumoBinary, "-c", "data/cross.sumocfg",
                      "--time-to-teleport", "-1",
-                     "--tripinfo-output", "tripinfo.xml", '--start', '-Q'], label='contestant')
+                     "--tripinfo-output", "tripinfo.xml", '--start', '-Q'], label=self._name)
         # Connection to simulation environment
-        self._conn = traci.getConnection("contestant")
+        self._conn = traci.getConnection(self._name)
 
         return ts.restart(np.array([self._state], dtype=np.int32))
     
@@ -180,8 +182,8 @@ class SimulationEnv(py_environment.PyEnvironment):
             return ts.transition(
                 np.array([self._state], dtype=np.int32), reward=reward, discount=self._gamma)
 
-    def stop():
-        traci.switch("contestant")
+    def stop(self):
+        traci.switch(self._name)
         traci.close()
 
 
@@ -469,36 +471,137 @@ def run_episode(conn, agent, competition_round, train=True):
     conn.close()
     return total_waiting_time, waiting_times, total_emissions
 
-train_env = SimulationEnv(1)
-eval_env = SimulationEnv(1)
-# utils.validate_py_environment(environment, episodes=5)
-tf_train_env = tf_py_environment.TFPyEnvironment(train_env)
-tf_eval_env = tf_py_environment.TFPyEnvironment(eval_env)
 
-time_step = tf_env.reset()
-rewards = []
-steps = []
-number_of_episodes = 200000
-COLLECTION_STEPS = 1
-BATCH_SIZE = 64
-EVAL_EPISODES = 10
-EVAL_INTERVAL = 1000
 
-for _ in range(number_of_episodes):
-    episode_reward = 0
-    episode_steps = 0
+num_iterations = 20000 # @param {type:"integer"}
+
+initial_collect_steps = 100  # @param {type:"integer"} 
+collect_steps_per_iteration = 1  # @param {type:"integer"}
+replay_buffer_max_length = 100000  # @param {type:"integer"}
+
+batch_size = 64  # @param {type:"integer"}
+learning_rate = 1e-3  # @param {type:"number"}
+log_interval = 200  # @param {type:"integer"}
+
+num_eval_episodes = 10  # @param {type:"integer"}
+eval_interval = 1000  # @param {type:"integer"}
+
+env = SimulationEnv('init', 1)
+env.reset()
+
+print('Observation Spec:')
+print(env.time_step_spec().observation)
+
+print('Reward Spec:')
+print(env.time_step_spec().reward)
+
+print('Action Spec:')
+print(env.action_spec())
+
+time_step = env.reset()
+print('Time step:')
+print(time_step)
+
+action = np.array(1, dtype=np.int32)
+
+next_time_step = env.step(action)
+print('Next time step:')
+print(next_time_step)
+
+train_py_env = SimulationEnv('train', 1)
+eval_py_env = SimulationEnv('eval', 1)
+
+train_env = tf_py_environment.TFPyEnvironment(train_py_env)
+eval_env = tf_py_environment.TFPyEnvironment(eval_py_env)
+
+fc_layer_params = (100, 50)
+action_tensor_spec = tensor_spec.from_spec(env.action_spec())
+num_actions = action_tensor_spec.maximum - action_tensor_spec.minimum + 1
+print(num_actions)
+# Define a helper function to create Dense layers configured with the right
+# activation and kernel initializer.
+def dense_layer(num_units):
+  return tf.keras.layers.Dense(
+      num_units,
+      activation=tf.keras.activations.relu,
+      kernel_initializer=tf.keras.initializers.VarianceScaling(
+          scale=2.0, mode='fan_in', distribution='truncated_normal'))
+
+# QNetwork consists of a sequence of Dense layers followed by a dense layer
+# with `num_actions` units to generate one q_value per available action as
+# it's output.
+dense_layers = [dense_layer(num_units) for num_units in fc_layer_params]
+q_values_layer = tf.keras.layers.Dense(
+    num_actions,
+    activation=None,
+    kernel_initializer=tf.keras.initializers.RandomUniform(
+        minval=-0.03, maxval=0.03),
+    bias_initializer=tf.keras.initializers.Constant(-0.2))
+q_net = sequential.Sequential(dense_layers + [q_values_layer])
+
+optimizer = tf.keras.optimizers.Adam(learning_rate=learning_rate)
+
+train_step_counter = tf.Variable(0)
+
+print(train_env.action_spec())
+
+agent = dqn_agent.DqnAgent(
+    train_env.time_step_spec(),
+    train_env.action_spec(),
+    q_network=q_net,
+    optimizer=optimizer,
+    td_errors_loss_fn=common.element_wise_squared_loss,
+    train_step_counter=train_step_counter)
+
+agent.initialize()
+
+eval_policy = agent.policy
+collect_policy = agent.collect_policy
+
+random_policy = random_tf_policy.RandomTFPolicy(train_env.time_step_spec(),
+                                                train_env.action_spec())
+                                            
+def compute_avg_return(environment, policy, num_episodes=10):
+
+  total_return = 0.0
+  for _ in range(num_episodes):
+
+    time_step = environment.reset()
+    episode_return = 0.0
+
     while not time_step.is_last():
-        action = tf.random.uniform([1], 0, 2, dtype=tf.int32)
-        time_step = tf_env.step(action)
-        episode_steps += 1
-        episode_reward += time_step.reward.numpy()
-        print("Action: ", action, "     Reward: ", episode_reward)
-    rewards.append(episode_reward)
-    steps.append(episode_steps)
-    time_step = tf_env.reset()
+      action_step = policy.action(time_step)
+      time_step = environment.step(action_step.action)
+      episode_return += time_step.reward
+    total_return += episode_return
 
-num_steps = np.sum(steps)
-avg_length = np.mean(steps)
-avg_reward = np.mean(rewards)
+  avg_return = total_return / num_episodes
+  return avg_return.numpy()[0]
 
-SimulationEnv.stop()
+
+print(compute_avg_return(eval_env, random_policy, num_eval_episodes))
+
+replay_buffer = tf_uniform_replay_buffer.TFUniformReplayBuffer(
+    data_spec=agent.collect_data_spec,
+    batch_size=train_env.batch_size,
+    max_length=replay_buffer_max_length)
+
+# for _ in range(number_of_episodes):
+#     episode_reward = 0
+#     episode_steps = 0
+#     while not time_step.is_last():
+#         action = tf.random.uniform([1], 0, 2, dtype=tf.int32)
+#         time_step = tf_train_env.step(action)
+#         episode_steps += 1
+#         episode_reward += time_step.reward.numpy()
+#         print("Action: ", action, "     Reward: ", episode_reward)
+#     rewards.append(episode_reward)
+#     steps.append(episode_steps)
+#     time_step = tf_train_env.reset()
+
+# num_steps = np.sum(steps)
+# avg_length = np.mean(steps)
+# avg_reward = np.mean(rewards)
+
+train_env.stop()
+eval_env.stop()
